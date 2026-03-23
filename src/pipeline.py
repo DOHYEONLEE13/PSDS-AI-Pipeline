@@ -21,6 +21,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from src.alerts.alert_manager import AlertManager
+from src.api.state import broadcaster
 from src.gesture_recognition.recognizer import (
     GestureRecognizer,
     GestureResult,
@@ -30,6 +32,7 @@ from src.gesture_recognition.recognizer import (
 from src.hand_tracking.tracker import HandTracker, TrackingResult
 from src.protection.protected_tracker import ProtectedPersonTracker, ProtectedPersonStatus
 from src.protection.protector import Protector
+from src.recording.recorder import VideoRecorder
 from src.threat_detection.approach_analyzer import ApproachAnalyzer
 from src.threat_detection.detector import SceneThreatDetector, ThreatLevel, ThreatResult
 from src.threat_detection.yolo_detector import PersonDetection, YOLOPersonDetector
@@ -79,6 +82,8 @@ class Pipeline:
         source: int | str | Path = 0,
         hand_model_path: str | Path = "models/hand_landmarker.task",
         yolo_model: object | None = None,
+        recorder: VideoRecorder | None = None,
+        alert_manager: AlertManager | None = None,
     ) -> None:
         self._source = source
         self._is_webcam = isinstance(source, int)
@@ -98,6 +103,9 @@ class Pipeline:
             approach_analyzer=ApproachAnalyzer(),
         )
         self._protector = Protector()
+
+        self._recorder: VideoRecorder | None = recorder
+        self._alert_manager: AlertManager | None = alert_manager
 
         # 런타임 상태
         self._fps: float = 30.0
@@ -444,10 +452,46 @@ class Pipeline:
                 except Exception:
                     logger.exception("Protector 오류")
 
+                # 자동 녹화 갱신
+                if self._recorder is not None:
+                    try:
+                        self._recorder.update(frame, threat.level)
+                    except Exception:
+                        logger.exception("VideoRecorder 오류")
+
+                # 경찰 신고 시뮬레이션
+                if self._alert_manager is not None:
+                    try:
+                        self._alert_manager.handle_threat(threat)
+                    except Exception:
+                        logger.exception("AlertManager 오류")
+
+                # API 서버 상태 갱신
+                try:
+                    broadcaster.update_sync(
+                        threat_level=threat.level.name,
+                        threat_score=threat.score,
+                        is_recording=self._recorder.is_recording if self._recorder else False,
+                        protected_person_id=self._protected_tracker.protected_id,
+                        is_protected_in_frame=(
+                            protected.is_in_frame if protected else False
+                        ),
+                        sos_detected=sos.is_detected,
+                    )
+                except Exception:
+                    logger.exception("상태 브로드캐스터 오류")
+
                 try:
                     self.draw_overlay(frame, sos, persons, protected, threat)
                 except Exception:
                     logger.exception("오버레이 그리기 오류")
+
+                # REC 표시
+                if self._recorder is not None:
+                    try:
+                        self._recorder.draw_rec_indicator(frame)
+                    except Exception:
+                        logger.exception("REC 표시 오류")
 
                 elapsed = time.monotonic() - t0
                 instant = 1.0 / elapsed if elapsed > 0 else 30.0
@@ -460,6 +504,9 @@ class Pipeline:
 
         cap.release()
         cv2.destroyAllWindows()
+
+        if self._recorder is not None:
+            self._recorder.stop()
 
 
 # ------------------------------------------------------------------
