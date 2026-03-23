@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 모델 가중치 (용량 큼)
+models/
+
+# 시크릿
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ruff
+.ruff_cache/
+
+# 빌드
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
