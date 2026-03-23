@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from src.api.state import broadcaster
 from src.threat_detection.detector import ThreatLevel, ThreatResult
 
 logger = logging.getLogger(__name__)
@@ -97,3 +98,9 @@ class AlertManager:
             logger.info("알림 JSON 저장: %s", filepath.name)
         except OSError as exc:
             logger.error("알림 JSON 저장 실패: %s", exc)
+
+        # API 서버 알림 이력에도 추가
+        try:
+            broadcaster.add_alert(payload)
+        except Exception:
+            pass

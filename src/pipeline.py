@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 from src.alerts.alert_manager import AlertManager
-from src.api.state import broadcaster
+from src.api.state import broadcaster  # noqa: E402
 from src.gesture_recognition.recognizer import (
     GestureRecognizer,
     GestureResult,
@@ -30,7 +30,7 @@ from src.gesture_recognition.recognizer import (
     SOSDetectionResult,
 )
 from src.hand_tracking.tracker import HandTracker, TrackingResult
-from src.protection.protected_tracker import ProtectedPersonTracker, ProtectedPersonStatus
+from src.protection.protected_tracker import ProtectedPersonStatus, ProtectedPersonTracker
 from src.protection.protector import Protector
 from src.recording.recorder import VideoRecorder
 from src.threat_detection.approach_analyzer import ApproachAnalyzer
@@ -114,6 +114,7 @@ class Pipeline:
         self._last_persons: list[PersonDetection] = []
         self._last_threat: ThreatResult = ThreatResult(level=ThreatLevel.NONE, score=0.0)
         self._last_wrists: dict[str, tuple[float, float]] = {}
+        self._protection_start_time: str | None = None  # 보호 대상 등록 시각
 
     # ------------------------------------------------------------------
     # 내부 로직
@@ -244,6 +245,8 @@ class Pipeline:
             if person_id is not None:
                 self._protected_tracker.register(person_id)
                 self._sos_detector.reset()
+                from datetime import datetime as _dt
+                self._protection_start_time = _dt.now().isoformat()
                 logger.info("보호 대상 등록: P%d", person_id)
         except Exception:
             logger.exception("보호 대상 등록 오류")
@@ -440,10 +443,24 @@ class Pipeline:
                 if self._is_webcam:
                     frame = cv2.flip(frame, 1)
 
+                _step_times: dict[str, float] = {}
+
+                _t = time.monotonic()
                 tracking = self._process_hand_tracking(frame)
+                _step_times["손 추적"] = (time.monotonic() - _t) * 1000
+
+                _t = time.monotonic()
                 gestures = self._process_gesture(tracking)
+                _step_times["제스처 인식"] = (time.monotonic() - _t) * 1000
+
+                _t = time.monotonic()
                 sos = self._process_sos(gestures)
+                _step_times["SOS 감지"] = (time.monotonic() - _t) * 1000
+
+                _t = time.monotonic()
                 persons, threat = self._process_yolo(frame, gestures)
+                _step_times["YOLO+위협"] = (time.monotonic() - _t) * 1000
+
                 self._process_registration(sos, gestures, persons)
                 protected = self._process_protected_tracking(persons)
 
@@ -477,6 +494,11 @@ class Pipeline:
                             protected.is_in_frame if protected else False
                         ),
                         sos_detected=sos.is_detected,
+                        fps=self._fps,
+                        inference_times=_step_times,
+                        sos_pending_duration=sos.held_duration if sos.is_pending else 0.0,
+                        sos_hold_seconds=self._SOS_HOLD_SECONDS,
+                        protected_track_start=self._protection_start_time,
                     )
                 except Exception:
                     logger.exception("상태 브로드캐스터 오류")
@@ -492,6 +514,16 @@ class Pipeline:
                         self._recorder.draw_rec_indicator(frame)
                     except Exception:
                         logger.exception("REC 표시 오류")
+
+                # 대시보드용 프레임 JPEG 인코딩
+                try:
+                    ok, jpg_buf = cv2.imencode(
+                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
+                    )
+                    if ok:
+                        broadcaster.set_frame_jpg(jpg_buf.tobytes())
+                except Exception:
+                    logger.exception("프레임 인코딩 오류")
 
                 elapsed = time.monotonic() - t0
                 instant = 1.0 / elapsed if elapsed > 0 else 30.0
