@@ -114,6 +114,7 @@ class Pipeline:
         self._last_persons: list[PersonDetection] = []
         self._last_threat: ThreatResult = ThreatResult(level=ThreatLevel.NONE, score=0.0)
         self._last_wrists: dict[str, tuple[float, float]] = {}
+        self._last_hand_centers: dict[str, tuple[float, float]] = {}  # 손 21개 관절 평균
         self._protection_start_time: str | None = None  # 보호 대상 등록 시각
 
     # ------------------------------------------------------------------
@@ -137,10 +138,14 @@ class Pipeline:
         gesture_results: list[GestureResult],
         persons: list[PersonDetection],
     ) -> int | None:
-        """V사인 손목 좌표를 YOLO 바운딩 박스에 매칭해 보호 대상 ID를 반환합니다.
+        """V사인 손 위치를 YOLO 바운딩 박스에 매칭해 보호 대상 ID를 반환합니다.
 
-        손목이 어떤 박스에도 포함되지 않으면 가장 먼저 감지된 인물을 반환합니다.
-        감지된 인물이 없으면 None 을 반환합니다.
+        손 21개 관절 평균 좌표(``_last_hand_centers``)를 우선 사용하고,
+        없으면 손목 좌표(``_last_wrists``)로 폴백합니다.
+
+        1차: 손 좌표가 bbox 안에 있는 인물 선택(여유 마진 5%).
+        2차: 박스 중심까지 거리가 가장 짧은 인물 선택.
+        인물이 없으면 None 을 반환합니다.
 
         Args:
             gesture_results: 현재 프레임의 GestureResult 목록.
@@ -149,19 +154,38 @@ class Pipeline:
         Returns:
             보호 대상으로 지정할 person_id. 인물 없으면 None.
         """
+        if not persons:
+            return None
+
         v_signs = [r for r in gesture_results if r.gesture.name == "V_SIGN"]
+        if not v_signs:
+            return persons[0].person_id
 
         for v in v_signs:
-            wrist = self._last_wrists.get(v.handedness)
-            if wrist is None:
+            hand_pos = self._last_hand_centers.get(v.handedness) or self._last_wrists.get(
+                v.handedness
+            )
+            if hand_pos is None:
                 continue
-            wx, wy = wrist
+            hx, hy = hand_pos
+            m = 0.05
+
+            # 1차: 손 좌표가 bbox(+마진) 안에 있는 인물
             for person in persons:
                 x1, y1, x2, y2 = person.bbox
-                if x1 <= wx <= x2 and y1 <= wy <= y2:
+                if (x1 - m) <= hx <= (x2 + m) and (y1 - m) <= hy <= (y2 + m):
                     return person.person_id
 
-        return persons[0].person_id if persons else None
+            # 2차: bbox 중심까지 거리가 가장 짧은 인물
+            return min(
+                persons,
+                key=lambda p: (
+                    (hx - (p.bbox[0] + p.bbox[2]) / 2) ** 2
+                    + (hy - (p.bbox[1] + p.bbox[3]) / 2) ** 2
+                ),
+            ).person_id
+
+        return persons[0].person_id
 
     # ------------------------------------------------------------------
     # 프레임별 처리 단계 (각각 try-except 로 격리)
@@ -175,11 +199,21 @@ class Pipeline:
             self._last_wrists = {
                 hand.handedness: (hand.landmarks[0][0], hand.landmarks[0][1])
                 for hand in result.hands
+                if hand.landmarks
+            }
+            self._last_hand_centers = {
+                hand.handedness: (
+                    sum(lm[0] for lm in hand.landmarks) / len(hand.landmarks),
+                    sum(lm[1] for lm in hand.landmarks) / len(hand.landmarks),
+                )
+                for hand in result.hands
+                if hand.landmarks
             }
             return result
         except Exception:
             logger.exception("HandTracker 오류")
             self._last_wrists = {}
+            self._last_hand_centers = {}
             return TrackingResult(hands=[], frame_index=0)
 
     def _process_gesture(self, tracking_result: TrackingResult) -> list[GestureResult]:
@@ -247,6 +281,7 @@ class Pipeline:
                 self._sos_detector.reset()
                 from datetime import datetime as _dt
                 self._protection_start_time = _dt.now().isoformat()
+                print(f"[PSDS] SOS 확정 → person_id={person_id} 보호 대상 등록")  # noqa: T201
                 logger.info("보호 대상 등록: P%d", person_id)
         except Exception:
             logger.exception("보호 대상 등록 오류")

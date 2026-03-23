@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -10,6 +11,9 @@ import numpy as np
 from src.threat_detection.yolo_detector import PersonDetection
 
 logger = logging.getLogger(__name__)
+
+_REIDENTIFY_DISTANCE: float = 0.2   # 정규화 좌표 기준 재연결 허용 거리
+_DISAPPEAR_WINDOW: float = 5.0      # 이탈 후 재연결 대기 시간(초)
 
 
 @dataclass
@@ -55,6 +59,7 @@ class ProtectedPersonTracker:
         self._protected_id: int | None = None
         self._last_bbox: tuple[float, float, float, float] | None = None
         self._prev_in_frame: bool = False
+        self._disappeared_at: float | None = None  # 이탈 첫 프레임 monotonic 시각
 
     # ------------------------------------------------------------------
     # 속성
@@ -84,6 +89,8 @@ class ProtectedPersonTracker:
         """
         self._protected_id = person_id
         self._prev_in_frame = False
+        self._last_bbox = None
+        self._disappeared_at = None
         logger.info("보호 대상 등록: P%d", person_id)
 
     def clear(self) -> None:
@@ -92,6 +99,7 @@ class ProtectedPersonTracker:
         self._protected_id = None
         self._last_bbox = None
         self._prev_in_frame = False
+        self._disappeared_at = None
         if prev is not None:
             logger.info("보호 대상 해제: P%d", prev)
 
@@ -118,16 +126,22 @@ class ProtectedPersonTracker:
         found = next(
             (p for p in persons if p.person_id == self._protected_id), None
         )
+
+        # ID로 못 찾은 경우: 이전에 이미 이탈한 상태라면 근접 재연결 시도
+        if found is None and self._disappeared_at is not None:
+            found = self._try_reidentify(persons)
+
         is_in_frame = found is not None
+        just_disappeared = self._prev_in_frame and not is_in_frame
 
         if found is not None:
             self._last_bbox = found.bbox
-
-        just_disappeared = self._prev_in_frame and not is_in_frame
-        self._prev_in_frame = is_in_frame
-
-        if just_disappeared:
+            self._disappeared_at = None
+        elif just_disappeared:
+            self._disappeared_at = time.monotonic()
             logger.warning("보호 대상 이탈: P%d", self._protected_id)
+
+        self._prev_in_frame = is_in_frame
 
         return ProtectedPersonStatus(
             person_id=self._protected_id,
@@ -135,6 +149,51 @@ class ProtectedPersonTracker:
             bbox=self._last_bbox,
             just_disappeared=just_disappeared,
         )
+
+    # ------------------------------------------------------------------
+    # 근접 재연결
+    # ------------------------------------------------------------------
+
+    def _try_reidentify(
+        self, persons: list[PersonDetection]
+    ) -> PersonDetection | None:
+        """이탈 후 근접 위치에 재등장한 인물로 보호 대상 ID를 교체합니다.
+
+        이탈 후 ``_DISAPPEAR_WINDOW`` 초 이내에 마지막 bbox 중심으로부터
+        ``_REIDENTIFY_DISTANCE`` 이내 인물이 있으면 그 인물로 재연결합니다.
+
+        Args:
+            persons: 현재 프레임의 PersonDetection 목록.
+
+        Returns:
+            재연결된 PersonDetection. 해당 인물이 없으면 None.
+        """
+        if not persons or self._last_bbox is None:
+            return None
+        if (
+            self._disappeared_at is not None
+            and time.monotonic() - self._disappeared_at > _DISAPPEAR_WINDOW
+        ):
+            return None
+
+        lx = (self._last_bbox[0] + self._last_bbox[2]) / 2
+        ly = (self._last_bbox[1] + self._last_bbox[3]) / 2
+
+        best_person: PersonDetection | None = None
+        best_dist: float = _REIDENTIFY_DISTANCE
+        for p in persons:
+            cx, cy = p.center
+            dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_person = p
+
+        if best_person is not None:
+            old_id = self._protected_id
+            self._protected_id = best_person.person_id
+            logger.info("보호 대상 재연결: P%d → P%d", old_id, best_person.person_id)
+
+        return best_person
 
     # ------------------------------------------------------------------
     # 시각화
